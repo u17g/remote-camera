@@ -15,6 +15,34 @@ final class ControllerModel {
         var id: String { name }
     }
 
+    /// A photo or video in the captures folder.
+    struct Capture: Identifiable, Hashable {
+        let url: URL
+        let kind: CapturedFile.Kind
+        let createdAt: Date
+        var id: URL { url }
+
+        init?(url: URL, createdAt: Date) {
+            switch url.pathExtension.lowercased() {
+            case "heic", "jpg", "jpeg", "png": kind = .photo
+            case "mov", "mp4": kind = .video
+            default: return nil
+            }
+            self.url = url
+            self.createdAt = createdAt
+        }
+    }
+
+    /// A file on its way from the iPhone.
+    struct Transfer: Equatable {
+        let file: CapturedFile
+        var received: Int64 = 0
+
+        var fraction: Double {
+            file.size > 0 ? Double(received) / Double(file.size) : 0
+        }
+    }
+
     enum Link: Equatable {
         case idle
         case connecting(String)
@@ -29,12 +57,16 @@ final class ControllerModel {
     private(set) var status: CameraStatus?
     private(set) var preview: CGImage?
     private(set) var notice: Notice?
+    /// Newest first: everything in the captures folder, and each shot as it arrives.
+    private(set) var captures: [Capture] = []
+    private(set) var transfer: Transfer?
     /// Bumped for every photo, to flash the preview.
     private(set) var shutterCount = 0
-    /// These two follow their sliders while they move; the camera's own values take over once
-    /// they settle, so a status sent mid-drag does not yank the knob back.
+    /// These follow their sliders while they move; the camera's own values take over once they
+    /// settle, so a status sent mid-drag does not yank the knob back.
     private(set) var zoom = 1.0
     private(set) var aperture = 0.0
+    private(set) var extraBlur = 0.0
     /// The camera the user picked. Remembered across launches, and reconnected to whenever it is
     /// on the network and we are not connected to it.
     private(set) var selectedCamera = UserDefaults.standard.string(forKey: ControllerModel.selectedCameraKey) {
@@ -53,6 +85,7 @@ final class ControllerModel {
     @ObservationIgnored private var reconnect: Task<Void, Never>?
     @ObservationIgnored private var zoomEditedAt = Date.distantPast
     @ObservationIgnored private var apertureEditedAt = Date.distantPast
+    @ObservationIgnored private var extraBlurEditedAt = Date.distantPast
     /// Who we are to the iPhone, which remembers the Macs it has allowed by this.
     @ObservationIgnored private let clientID: String = {
         if let id = UserDefaults.standard.string(forKey: ControllerModel.clientIDKey) { return id }
@@ -60,6 +93,9 @@ final class ControllerModel {
         UserDefaults.standard.set(id, forKey: ControllerModel.clientIDKey)
         return id
     }()
+
+    /// Where the iPhone's photos and videos land on this Mac.
+    static let capturesFolder = URL.picturesDirectory.appending(path: "Remote Camera", directoryHint: .isDirectory)
 
     private static let selectedCameraKey = "selectedCamera"
     private static let isListeningKey = "isListening"
@@ -72,6 +108,7 @@ final class ControllerModel {
 
     func start() {
         guard browser == nil else { return }
+        loadCaptures()
         audio.setMuted(!isListening)
         let browser = NWBrowser(for: .bonjour(type: Wire.serviceType, domain: nil), using: .remoteCamera)
         browser.browseResultsChangedHandler = { [weak self] results, _ in
@@ -134,6 +171,14 @@ final class ControllerModel {
         send(.setAperture(aperture))
     }
 
+    func setExtraBlur(_ strength: Double) {
+        let strength = (min(max(strength, 0), 1) * 100).rounded() / 100
+        guard strength != extraBlur else { return }
+        extraBlur = strength
+        extraBlurEditedAt = .now
+        send(.setExtraBlur(strength))
+    }
+
     func setZoom(_ zoom: Double) {
         // In tenths, as the Camera app shows it: 1.2×, not 1.2371×.
         var zoom = (zoom * 10).rounded() / 10
@@ -148,6 +193,42 @@ final class ControllerModel {
 
     func clearNotice(_ id: Notice.ID) {
         if notice?.id == id { notice = nil }
+    }
+
+    // MARK: - Captures
+
+    private func loadCaptures() {
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: Self.capturesFolder,
+            includingPropertiesForKeys: [.creationDateKey],
+            options: .skipsHiddenFiles
+        )) ?? []
+        captures = urls
+            .compactMap { url in
+                Capture(url: url, createdAt: (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast)
+            }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    private func transferStarted(_ file: CapturedFile) {
+        transfer = Transfer(file: file)
+    }
+
+    private func transferProgressed(_ progress: CaptureReceiver.Progress) {
+        guard transfer?.file.id == progress.file.id else { return }
+        transfer?.received = progress.received
+    }
+
+    private func captureArrived(at url: URL, _ file: CapturedFile) {
+        if transfer?.file.id == file.id { transfer = nil }
+        if let capture = Capture(url: url, createdAt: file.createdAt) {
+            captures.insert(capture, at: 0)
+        }
+    }
+
+    private func transferFailed(_ error: Error) {
+        transfer = nil
+        notice = Notice("Not saved on the Mac: \(error.localizedDescription) It is still in Photos on the iPhone.", isError: true)
     }
 
     private func send(_ command: Command) {
@@ -203,26 +284,62 @@ final class ControllerModel {
         self.peer = peer
         link = .connecting(camera.name)
         let audio = self.audio
+        let receiver = CaptureReceiver(folder: Self.capturesFolder)
         peer.start { [weak self] event in
-            // Media is decoded here, off the main thread. Only finished pictures and control
-            // traffic go to the main actor.
-            if case .frame(let frame) = event {
+            // Media and files are dealt with here, off the main thread: pictures decoded, sound
+            // played, files written. Only their results and control traffic go to the main actor.
+            // This is also the only place the receiver is used, so it needs no lock.
+            let onMain = { (work: @escaping @MainActor @Sendable (ControllerModel) -> Void) in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { if let self { work(self) } }
+                }
+            }
+            switch event {
+            case .ready:
+                onMain { $0.linkReady(peer) }
+            case .closed(let error):
+                receiver.cancel()
+                onMain { $0.linkClosed(peer, error: error) }
+            case .frame(let frame):
                 switch frame.kind {
                 case .video:
                     guard let image = decodeImage(frame.payload) else { return }
-                    DispatchQueue.main.async {
-                        MainActor.assumeIsolated { self?.show(image, from: peer) }
-                    }
-                    return
+                    onMain { $0.show(image, from: peer) }
                 case .audio:
                     if let chunk = AudioChunk(payload: frame.payload) { audio.play(chunk) }
-                    return
+                case .fileChunk:
+                    guard let chunk = FileChunk(payload: frame.payload) else { return }
+                    do {
+                        if let progress = try receiver.append(chunk) {
+                            onMain { $0.transferProgressed(progress) }
+                        }
+                    } catch {
+                        onMain { $0.transferFailed(error) }
+                    }
                 case .control:
-                    break
+                    guard let message = try? frame.controlMessage() else { return }
+                    switch message {
+                    case .fileStart(let file):
+                        do {
+                            try receiver.start(file)
+                            onMain { $0.transferStarted(file) }
+                        } catch {
+                            onMain { $0.transferFailed(error) }
+                        }
+                    case .fileEnd(let id):
+                        // Confirmed even when it failed here, or the iPhone would hold up every
+                        // shot behind this one. It is in Photos on the iPhone regardless.
+                        defer { peer.send(.fileReceived(id: id)) }
+                        do {
+                            let saved = try receiver.finish(id)
+                            onMain { $0.captureArrived(at: saved.url, saved.file) }
+                        } catch {
+                            onMain { $0.transferFailed(error) }
+                        }
+                    default:
+                        onMain { $0.received(message, from: peer) }
+                    }
                 }
-            }
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.handle(event, from: peer) }
             }
         }
         // A phone that vanished without saying goodbye still shows up for a while, and connecting
@@ -235,24 +352,22 @@ final class ControllerModel {
         }
     }
 
-    private func handle(_ event: PeerConnection.Event, from peer: PeerConnection) {
+    private func linkReady(_ peer: PeerConnection) {
         guard peer === self.peer else { return }
-        switch event {
-        case .ready:
-            if case .connecting(let name) = link { link = .awaitingApproval(name) }
-            peer.send(.hello(clientID: clientID, name: Self.computerName, version: Wire.protocolVersion))
-        case .frame(let frame):
-            guard let message = try? frame.controlMessage() else { return }
-            received(message)
-        case .closed(let error):
-            if let error { Log.net.info("Connection closed: \(error)") }
-            dropConnection()
-            // The phone may have gone to the background or switched networks; it will be back.
-            scheduleReconnect()
-        }
+        if case .connecting(let name) = link { link = .awaitingApproval(name) }
+        peer.send(.hello(clientID: clientID, name: Self.computerName, version: Wire.protocolVersion))
     }
 
-    private func received(_ message: ControlMessage) {
+    private func linkClosed(_ peer: PeerConnection, error: NWError?) {
+        guard peer === self.peer else { return }
+        if let error { Log.net.info("Connection closed: \(error)") }
+        dropConnection()
+        // The phone may have gone to the background or switched networks; it will be back.
+        scheduleReconnect()
+    }
+
+    private func received(_ message: ControlMessage, from peer: PeerConnection) {
+        guard peer === self.peer else { return }
         switch message {
         case .welcome:
             if case .awaitingApproval(let name) = link { link = .connected(name) }
@@ -269,9 +384,12 @@ final class ControllerModel {
             if Date.now.timeIntervalSince(apertureEditedAt) > 0.5 {
                 aperture = status.aperture
             }
+            if Date.now.timeIntervalSince(extraBlurEditedAt) > 0.5 {
+                extraBlur = status.extraBlur
+            }
         case .event(let event):
             notice = Notice(event)
-        case .hello, .command:
+        case .hello, .command, .fileReceived, .fileStart, .fileEnd:
             break
         }
     }
@@ -288,6 +406,7 @@ final class ControllerModel {
         link = .idle
         status = nil
         preview = nil
+        transfer = nil
         audio.stop()
     }
 

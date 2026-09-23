@@ -15,12 +15,10 @@ enum PhotoLibrary {
         }
     }
 
-    /// Moves the movie into the library, so on success the file at `url` is gone.
+    /// Copies the movie into the library; the file at `url` stays.
     static func saveVideo(at url: URL) async throws {
         try await PHPhotoLibrary.shared().performChanges {
-            let options = PHAssetResourceCreationOptions()
-            options.shouldMoveFile = true
-            PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: url, options: options)
+            PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: url, options: nil)
         }
     }
 }

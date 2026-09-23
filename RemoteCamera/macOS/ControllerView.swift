@@ -1,4 +1,6 @@
 #if os(macOS)
+import QuickLook
+import QuickLookThumbnailing
 import SwiftUI
 
 /// The remote: the iPhones on the network on the left, the chosen one's picture and controls on
@@ -13,12 +15,21 @@ struct ControllerView: View {
         } detail: {
             VStack(spacing: 0) {
                 PreviewPane(model: model)
+                if !model.captures.isEmpty || model.transfer != nil {
+                    Divider()
+                    CaptureStrip(model: model)
+                }
                 Divider()
                 ControlBar(model: model)
             }
             .navigationTitle(title)
             .navigationSubtitle(subtitle)
             .toolbar {
+                Button("Show Captures", systemImage: "folder") {
+                    try? FileManager.default.createDirectory(at: ControllerModel.capturesFolder, withIntermediateDirectories: true)
+                    NSWorkspace.shared.open(ControllerModel.capturesFolder)
+                }
+                .help("Open the folder the iPhone’s photos and videos are copied to")
                 if model.selectedCamera != nil {
                     Button("Disconnect", systemImage: "xmark.circle") { model.disconnect() }
                         .help("Disconnect from this iPhone")
@@ -111,20 +122,26 @@ private struct CameraSettings: View {
                 }
                 .disabled(isLocked)
             }
-            if status.mode == .video, status.canUseCinematic {
+            if status.mode == .video {
                 setting("Background Blur") {
-                    HStack {
-                        Text("Cinematic")
-                        Spacer()
-                        Toggle("Cinematic", isOn: Binding(get: { status.isCinematic }, set: { model.setCinematic($0) }))
-                            .toggleStyle(.switch)
-                            .controlSize(.small)
+                    if status.canUseCinematic {
+                        Group {
+                            HStack {
+                                Text("Cinematic")
+                                Spacer()
+                                Toggle("Cinematic", isOn: Binding(get: { status.isCinematic }, set: { model.setCinematic($0) }))
+                                    .toggleStyle(.switch)
+                                    .controlSize(.small)
+                            }
+                            if status.isCinematic, status.maxAperture > status.minAperture {
+                                ApertureSlider(model: model, range: status.minAperture...status.maxAperture)
+                            }
+                        }
+                        .disabled(isLocked)
                     }
-                    if status.isCinematic, status.maxAperture > status.minAperture {
-                        ApertureSlider(model: model, range: status.minAperture...status.maxAperture)
-                    }
+                    ExtraBlurSlider(model: model)
+                        .disabled(!model.isReady)
                 }
-                .disabled(isLocked)
             }
         }
         .pickerStyle(.segmented)
@@ -139,6 +156,22 @@ private struct CameraSettings: View {
                 .foregroundStyle(.secondary)
             control()
         }
+    }
+}
+
+/// More blur behind people, added to Cinematic mode's. Works while recording, too.
+private struct ExtraBlurSlider: View {
+    let model: ControllerModel
+
+    var body: some View {
+        HStack {
+            Text("People +")
+            Slider(value: Binding(get: { model.extraBlur }, set: { model.setExtraBlur($0) }), in: 0...1)
+            Text(model.extraBlur.formatted(.percent.precision(.fractionLength(0))))
+                .monospacedDigit()
+                .frame(width: 40, alignment: .trailing)
+        }
+        .help("Blur the background behind people even more, on top of Cinematic mode. Finds people only.")
     }
 }
 
@@ -240,6 +273,87 @@ private struct PreviewPane: View {
             status.problem,
             status.canSaveToPhotos ? nil : "Photos access is off on the iPhone, so nothing can be saved.",
         ].compactMap(\.self)
+    }
+}
+
+/// The latest shots, newest first, copied over from the iPhone as they are taken. Click one to
+/// look at it (arrow keys move through the rest), or drag it out into another app.
+private struct CaptureStrip: View {
+    let model: ControllerModel
+    @State private var lookingAt: URL?
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: 8) {
+                if let transfer = model.transfer {
+                    TransferTile(transfer: transfer)
+                }
+                ForEach(model.captures) { capture in
+                    CaptureThumbnail(capture: capture)
+                        .onTapGesture { lookingAt = capture.url }
+                        .draggable(capture.url)
+                        .contextMenu {
+                            Button("Open") { NSWorkspace.shared.open(capture.url) }
+                            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([capture.url]) }
+                        }
+                        .help(capture.url.lastPathComponent)
+                }
+            }
+            .padding(8)
+        }
+        .frame(height: 88)
+        .background(.bar)
+        .quickLookPreview($lookingAt, in: model.captures.map(\.url))
+    }
+}
+
+private struct CaptureThumbnail: View {
+    static let size = CGSize(width: 72, height: 72)
+
+    let capture: ControllerModel.Capture
+    @State private var thumbnail: CGImage?
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            Rectangle().fill(.quaternary)
+            if let thumbnail {
+                Image(decorative: thumbnail, scale: 2)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            }
+            if capture.kind == .video {
+                Image(systemName: "video.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.white)
+                    .shadow(radius: 2)
+                    .padding(5)
+            }
+        }
+        .frame(width: Self.size.width, height: Self.size.height)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .contentShape(RoundedRectangle(cornerRadius: 6))
+        .task(id: capture.url) {
+            let request = QLThumbnailGenerator.Request(fileAt: capture.url, size: Self.size, scale: 2, representationTypes: .thumbnail)
+            thumbnail = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request).cgImage
+        }
+    }
+}
+
+private struct TransferTile: View {
+    let transfer: ControllerModel.Transfer
+
+    var body: some View {
+        VStack(spacing: 6) {
+            ProgressView(value: transfer.fraction)
+                .progressViewStyle(.circular)
+                .controlSize(.small)
+            Text(transfer.file.kind == .video ? "Video" : "Photo")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(width: CaptureThumbnail.size.width, height: CaptureThumbnail.size.height)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+        .help("Copying \(transfer.file.name) from the iPhone")
     }
 }
 

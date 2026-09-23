@@ -157,6 +157,7 @@ final class HostModel {
                 controller = nil
                 controllerName = nil
                 camera.streamer.attach(nil)
+                camera.outbox.attach(nil)
             }
         }
     }
@@ -178,7 +179,10 @@ final class HostModel {
         case .command(let command):
             guard peer === controller else { return }
             camera.perform(command)
-        case .welcome, .rejected, .status, .event:
+        case .fileReceived(let id):
+            guard peer === controller else { return }
+            camera.outbox.delivered(id)
+        case .welcome, .rejected, .status, .event, .fileStart, .fileEnd:
             break
         }
     }
@@ -193,6 +197,8 @@ final class HostModel {
         peer.send(.welcome(deviceName: UIDevice.current.name))
         peer.send(.status(status))
         camera.streamer.attach(peer)
+        // Whatever was shot while no Mac was connected goes now.
+        camera.outbox.attach(peer)
     }
 
     // MARK: - Camera

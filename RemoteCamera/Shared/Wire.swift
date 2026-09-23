@@ -7,7 +7,7 @@ import Foundation
 enum Wire {
     static let serviceType = "_remotecam._tcp"
     /// Bump whenever a change to the messages below would confuse an older build on the other end.
-    static let protocolVersion = 5
+    static let protocolVersion = 7
     /// Far above any real frame (a preview JPEG is tens of KB); anything larger means a corrupt stream.
     static let maxFrameLength = 8 * 1024 * 1024
 }
@@ -19,6 +19,8 @@ enum FrameKind: UInt8, Sendable {
     case video = 2
     /// One `AudioChunk`, camera to controller.
     case audio = 3
+    /// One `FileChunk` of a photo or video being copied to the controller.
+    case fileChunk = 4
 }
 
 struct Frame: Sendable {
@@ -100,6 +102,49 @@ struct AudioChunk: Sendable {
     }
 }
 
+/// A photo or video on its way from the iPhone to the Mac, announced by `ControlMessage.fileStart`
+/// and sent as `FileChunk`s.
+struct CapturedFile: Codable, Sendable, Equatable {
+    enum Kind: String, Codable, Sendable {
+        case photo
+        case video
+    }
+
+    let id: UUID
+    /// A file name to save it under. It comes from the other device: use its last path component
+    /// only.
+    let name: String
+    let kind: Kind
+    let size: Int64
+    let createdAt: Date
+}
+
+/// The next piece of a `CapturedFile`; pieces arrive in order. On the wire: the file's UUID as
+/// 16 bytes, then the bytes.
+struct FileChunk: Sendable {
+    let id: UUID
+    let data: Data
+
+    init(id: UUID, data: Data) {
+        self.id = id
+        self.data = data
+    }
+
+    init?(payload: Data) {
+        guard payload.count >= 16 else { return nil }
+        let start = payload.startIndex
+        id = UUID(uuid: payload[start..<start + 16].withUnsafeBytes { $0.loadUnaligned(as: uuid_t.self) })
+        data = payload.subdata(in: start + 16..<payload.endIndex)
+    }
+
+    var payload: Data {
+        var payload = Data(capacity: 16 + data.count)
+        withUnsafeBytes(of: id.uuid) { payload.append(contentsOf: $0) }
+        payload.append(data)
+        return payload
+    }
+}
+
 // MARK: - Control messages
 
 enum CaptureMode: String, Codable, Sendable {
@@ -145,6 +190,10 @@ struct CameraStatus: Codable, Sendable, Equatable {
     var aperture = 0.0
     var minAperture = 0.0
     var maxAperture = 0.0
+    /// More blur behind people, on top of Cinematic mode's, from 0 (none) to 1. The app's own
+    /// processing rather than the camera's, so it has no upper limit set by iOS and can change
+    /// while recording. Video mode only.
+    var extraBlur = 0.0
     var hasAudio = false
     /// False when the iPhone's Photos access is off: shots would be taken and then lost.
     var canSaveToPhotos = true
@@ -170,9 +219,12 @@ struct CameraStatus: Codable, Sendable, Equatable {
     var summary: String? {
         guard isAvailable else { return nil }
         let side = position == .front ? "Front" : "Back"
-        let parts = isCinematicActive
+        var parts = isCinematicActive
             ? [side, "Cinematic \(fNumber(aperture))", resolution.rawValue]
             : [side, mode == .video ? resolution.rawValue : "Photo"]
+        if mode == .video, extraBlur > 0 {
+            parts.insert("Blur +\(extraBlur.formatted(.percent.precision(.fractionLength(0))))", at: parts.count - 1)
+        }
         return (isMirrored ? [parts[0], "Mirrored"] + parts.dropFirst() : parts).joined(separator: " · ")
     }
 }
@@ -199,6 +251,7 @@ enum Command: Codable, Sendable {
     case setCinematic(Bool)
     /// The simulated f-number for Cinematic mode.
     case setAperture(Double)
+    case setExtraBlur(Double)
     case setZoom(Double)
 }
 
@@ -212,11 +265,16 @@ enum ControlMessage: Codable, Sendable {
     // Controller to camera.
     case hello(clientID: String, name: String, version: Int)
     case command(Command)
+    /// The file is saved on the Mac; the iPhone can delete its copy.
+    case fileReceived(id: UUID)
     // Camera to controller.
     case welcome(deviceName: String)
     case rejected(reason: String)
     case status(CameraStatus)
     case event(CameraEvent)
+    /// A photo or video follows as `FileChunk`s, then `fileEnd`.
+    case fileStart(CapturedFile)
+    case fileEnd(id: UUID)
 }
 
 /// A short message to show over the preview for a few seconds.

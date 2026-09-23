@@ -47,6 +47,16 @@ blurs the background more. It is the Camera app's Cinematic effect (iOS 26, iPho
 visible in the Mac's preview and recorded into the video. The physical aperture of an iPhone lens
 is fixed; there is nothing to set for photos.
 
+iOS will not blur more than Cinematic mode's lowest f-number, so **People +** adds more on top:
+Vision finds the people in each frame and the rest is blurred as hard as the slider says
+(`iOS/BackgroundBlur.swift`). It works on people only, with or without Cinematic mode, in Video
+mode, and it can change while recording.
+
+Every photo and video is also copied to the Mac as soon as it is taken, into
+`~/Pictures/Remote Camera`, and shows up under the preview. Click one to look at it (videos play),
+right-click to open it or show it in Finder, or drag it into another app. Shots taken while no Mac
+is connected wait on the iPhone and follow when one connects.
+
 ## How it works
 
 - The iPhone advertises `_remotecam._tcp` over Bonjour; the Mac browses for it and connects over
@@ -56,6 +66,10 @@ is fixed; there is nothing to set for photos.
   up with is dropped rather than queued, so the preview stays live.
 - Photos come from `AVCapturePhotoOutput`. Videos are written with `AVAssetWriter` from the same
   sample buffers that feed the preview (`iOS/CameraService.swift`, `iOS/MovieRecorder.swift`).
+- Each shot is saved to Photos and put in an outbox on the iPhone (`iOS/Outbox.swift`), which sends
+  it to the Mac in 256 KB chunks over the same connection, a few at a time so the preview keeps
+  flowing. The Mac files it (`macOS/CaptureReceiver.swift`) and confirms; only then does the
+  iPhone delete its copy. Undelivered files over 2 GB are dropped, oldest first.
 
 The link is not encrypted, and the iPhone recognises an allowed Mac by an ID the Mac sends in the
 clear. That is fine on a home network; on a network you do not trust, someone could watch the

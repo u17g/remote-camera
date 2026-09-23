@@ -17,6 +17,8 @@ import Synchronization
 final class CameraService: NSObject, @unchecked Sendable {
     let session = AVCaptureSession()
     let streamer: MediaStreamer
+    /// Every photo and video also goes to the Mac, through this.
+    let outbox = Outbox()
 
     /// Called on any queue after `status` changes. Set before `start()`.
     var onStatusChange: (@Sendable () -> Void)?
@@ -34,6 +36,7 @@ final class CameraService: NSObject, @unchecked Sendable {
     private let photoOutput = AVCapturePhotoOutput()
     private let previewEncoder: PreviewEncoder
     private let audioEncoder: AudioPreviewEncoder
+    private let backgroundBlur = BackgroundBlur()
     private let statusStore = Mutex(CameraStatus())
     /// Degrees clockwise that turn the sensor's image upright, from the rotation coordinator.
     private let captureAngle = Mutex<CGFloat>(90)
@@ -49,6 +52,7 @@ final class CameraService: NSObject, @unchecked Sendable {
         var aperture = 0.0
         /// Per side, so that turning to the front brings back the selfie view.
         var mirrored: [CameraPosition: Bool] = [.front: true]
+        var extraBlur = 0.0
 
         var isMirrored: Bool {
             mirrored[position] ?? false
@@ -59,6 +63,7 @@ final class CameraService: NSObject, @unchecked Sendable {
             var structure = self
             structure.aperture = 0
             structure.mirrored = [:]
+            structure.extraBlur = 0
             return structure
         }
     }
@@ -120,6 +125,7 @@ final class CameraService: NSObject, @unchecked Sendable {
         case .setMirrored(let isOn): change { setup in setup.mirrored[setup.position] = isOn }
         case .setCinematic(let isOn): change { $0.cinematic = isOn }
         case .setAperture(let aperture): change { $0.aperture = aperture }
+        case .setExtraBlur(let strength): setExtraBlur(strength)
         case .setZoom(let zoom): setZoom(zoom)
         }
         #endif
@@ -293,6 +299,7 @@ final class CameraService: NSObject, @unchecked Sendable {
             status.maxZoom = zoomScale * zoomFactors.upperBound
             status.zoomPresets = zoomPresets
         }
+        applyExtraBlur(setup)
         outputsChanged(for: device)
         // Keep the framing when only the mode or resolution changed; another camera starts at 1×.
         applyZoom(device == previousDevice ? status.zoom : 1, on: device)
@@ -353,6 +360,23 @@ final class CameraService: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Unlike the rest of the setup this can change mid-recording: it is the app's own processing,
+    /// and the movie keeps its shape.
+    private func setExtraBlur(_ strength: Double) {
+        sessionQueue.async { [self] in
+            guard var setup else { return }
+            setup.extraBlur = min(max(strength, 0), 1)
+            self.setup = setup
+            applyExtraBlur(setup)
+        }
+    }
+
+    /// Video mode only: photos do not get it, so the preview should not suggest they will.
+    private func applyExtraBlur(_ setup: Setup) {
+        backgroundBlur.strength = setup.mode == .video ? setup.extraBlur : 0
+        updateStatus { $0.extraBlur = setup.extraBlur }
+    }
+
     private func setZoom(_ zoom: Double) {
         sessionQueue.async { [self] in
             guard let device = videoInput?.device else { return }
@@ -386,25 +410,36 @@ final class CameraService: NSObject, @unchecked Sendable {
                 connection.videoRotationAngle = angle
             }
             Self.mirror(connection, status.isMirrored)
-            let settings = photoOutput.availablePhotoCodecTypes.contains(.hevc)
+            let isHEIF = photoOutput.availablePhotoCodecTypes.contains(.hevc)
+            let settings = isHEIF
                 ? AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
                 : AVCapturePhotoSettings()
             settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
             let id = settings.uniqueID
-            let capture = PhotoCapture { [weak self] result in self?.photoFinished(id, result) }
+            let capture = PhotoCapture { [weak self] result in
+                self?.photoFinished(id, fileExtension: isHEIF ? "heic" : "jpg", result)
+            }
             photoCaptures[id] = capture
             photoOutput.capturePhoto(with: settings, delegate: capture)
         }
     }
 
-    private func photoFinished(_ id: Int64, _ result: Result<Data, Error>) {
+    private func photoFinished(_ id: Int64, fileExtension: String, _ result: Result<Data, Error>) {
         sessionQueue.async { [self] in photoCaptures[id] = nil }
+        let data: Data
+        do {
+            data = try result.get()
+        } catch {
+            return emit(.failed("Photo not taken: \(error.localizedDescription)"))
+        }
+        // To the Mac even if Photos refuses it, so the shot is not lost.
+        outbox.add(data, fileExtension: fileExtension)
         Task {
             do {
-                try await PhotoLibrary.savePhoto(result.get())
+                try await PhotoLibrary.savePhoto(data)
                 emit(.photoSaved)
             } catch {
-                emit(.failed("Photo not saved: \(error.localizedDescription)"))
+                emit(.failed("Photo not saved to Photos: \(error.localizedDescription)"))
             }
         }
     }
@@ -484,19 +519,22 @@ final class CameraService: NSObject, @unchecked Sendable {
             // The phone may have been turned during the take.
             sessionQueue.async { [self] in updateVideoOrientation() }
             recorder.finish { [weak self] result in
+                guard let self else { return }
+                let movie: (url: URL, duration: TimeInterval)
+                do {
+                    movie = try result.get()
+                } catch {
+                    return emit(.failed("Video not saved: \(error.localizedDescription)"))
+                }
                 Task {
                     do {
-                        let movie = try result.get()
-                        do {
-                            try await PhotoLibrary.saveVideo(at: movie.url)
-                        } catch {
-                            try? FileManager.default.removeItem(at: movie.url)
-                            throw error
-                        }
-                        self?.emit(.videoSaved(duration: movie.duration))
+                        try await PhotoLibrary.saveVideo(at: movie.url)
+                        self.emit(.videoSaved(duration: movie.duration))
                     } catch {
-                        self?.emit(.failed("Video not saved: \(error.localizedDescription)"))
+                        self.emit(.failed("Video not saved to Photos: \(error.localizedDescription)"))
                     }
+                    // Photos keeps a copy of its own; this one goes to the Mac either way.
+                    self.outbox.add(movingFileAt: movie.url)
                 }
             }
         }
@@ -647,9 +685,18 @@ final class CameraService: NSObject, @unchecked Sendable {
 extension CameraService: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         if output === videoOutput {
-            recorder?.appendVideo(sampleBuffer)
-            previewEncoder.offer {
-                sampleBuffer.imageBuffer.map { CIImage(cvPixelBuffer: $0) }
+            guard let pixelBuffer = sampleBuffer.imageBuffer else { return }
+            if !backgroundBlur.isActive {
+                recorder?.appendVideo(sampleBuffer)
+                previewEncoder.offer { CIImage(cvPixelBuffer: pixelBuffer) }
+            } else if let recorder {
+                // Every frame is blurred for the movie; the preview takes some of the same.
+                let blurred = backgroundBlur.render(pixelBuffer)
+                recorder.appendVideo(blurred.flatMap(sampleBuffer.replacingImageBuffer) ?? sampleBuffer)
+                previewEncoder.offer { CIImage(cvPixelBuffer: blurred ?? pixelBuffer) }
+            } else {
+                // Not recording: only the frames the preview sends are worth blurring.
+                previewEncoder.offer { backgroundBlur.blurred(pixelBuffer) }
             }
         } else if output === audioOutput {
             recorder?.appendAudio(sampleBuffer)
@@ -718,11 +765,14 @@ extension CameraService {
             updateStatus { $0.isCinematic = isOn }
         case .setAperture(let aperture):
             updateStatus { $0.aperture = min(max(aperture, $0.minAperture), $0.maxAperture) }
+        case .setExtraBlur(let strength):
+            updateStatus { $0.extraBlur = min(max(strength, 0), 1) }
         case .setZoom(let zoom):
             updateStatus { $0.zoom = min(max(zoom, $0.minZoom), $0.maxZoom) }
         case .takePhoto:
-            // Saves a frame of the pattern, so the path into Photos gets exercised too.
+            // Saves a frame of the pattern, so the paths into Photos and to the Mac get exercised too.
             guard let data = testPattern.snapshot() else { return }
+            outbox.add(data, fileExtension: "jpg")
             Task {
                 do {
                     try await PhotoLibrary.savePhoto(data)
@@ -734,13 +784,11 @@ extension CameraService {
         case .startRecording, .stopRecording:
             emit(.failed("The Simulator has no camera to do that with."))
         }
-        // Stand in for the cinematic effect by blurring the stripes behind the clock.
+        // Stand in for Cinematic mode and the extra blur by blurring the stripes behind the clock.
         let status = self.status
-        testPattern.setAppearance(
-            zoom: status.zoom,
-            backgroundBlur: status.isCinematicActive ? 40 / status.aperture : 0,
-            isMirrored: status.isMirrored
-        )
+        let cinematicBlur = status.isCinematicActive ? 40 / status.aperture : 0
+        let extraBlur = status.mode == .video ? status.extraBlur * 30 : 0
+        testPattern.setAppearance(zoom: status.zoom, backgroundBlur: cinematicBlur + extraBlur, isMirrored: status.isMirrored)
     }
 
     /// A 16 Pro: ultra wide, wide and a 5× telephoto on the back, one lens on the front.
