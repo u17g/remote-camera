@@ -1,0 +1,7 @@
+- write code or comment in English. not the other language.
+- Never run the whole test suite on your own. I will ask for it when I want it.
+- Keep a self-initiated UI run to one class at most: every test method relaunches the app and each launch costs about 5 s.
+- Building to check that the code compiles is fine and does not count as running tests.
+- Debug is not the product for anything numeric. A live motion track runs at ~4 fps in Debug and 63.5 fps optimised — 15-20x. To measure a real cost: `make ios_uitest ONLY=<UIClass> CONFIGURATION=Release XCSETTINGS='SWIFT_ENABLE_TESTABILITY=YES SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG'` (testability so the unit bundle still resolves, DEBUG so the launch hooks survive; neither changes the optimisation level). The tracker logs its per-stage cost through os_log — read it with `xcrun simctl spawn "iPhone 17 Pro" log show --last 3m --predicate 'subsystem == "com.snip0.ios"'`.
+- Always build and test through the Makefile, never a bare `xcodebuild`. A bare invocation has no `-derivedDataPath`, so it builds into Xcode's default DerivedData instead of `ios/.build/DerivedData` and throws away everything `make ios_build` just compiled.
+- If you finish a change without running tests, just say what is unverified. Do not run them to be safe.
