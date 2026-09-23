@@ -5,6 +5,7 @@
 #   make build       : mac_build + ios_build
 #   make mac_build   : build the Mac app (the remote)
 #   make mac_run     : build it, quit any running copy, launch it
+#   make mac_install : an optimised build into /Applications as "Remote Camera", then launch it
 #   make ios_build   : build the iPhone app for the Simulator
 #   make ios_run     : install + launch it on the Simulator. The Simulator has no camera, so it
 #                      streams a test pattern and a once-a-second tick instead; enough to work on
@@ -35,6 +36,8 @@ XCSETTINGS    ?=
 MAC_DEST      := platform=macOS
 SIM_DEST      := platform=iOS Simulator,name=$(SIMULATOR)
 MAC_APP       := $(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/$(PROJECT).app
+MAC_INSTALL_DIR ?= /Applications
+MAC_INSTALLED_APP := $(MAC_INSTALL_DIR)/Remote Camera.app
 SIM_APP       := $(DERIVED_DATA)/Build/Products/$(CONFIGURATION)-iphonesimulator/$(PROJECT).app
 DEVICE_APP    := $(DERIVED_DATA)/Build/Products/$(CONFIGURATION)-iphoneos/$(PROJECT).app
 
@@ -48,7 +51,7 @@ TEAM_FLAG     := $(if $(TEAM),DEVELOPMENT_TEAM=$(TEAM),)
 # Auto-detection prefers a device whose tunnel is connected, then falls back to the first paired one.
 DEVICE ?= $(shell xcrun devicectl list devices --json-output /tmp/remotecamera-devices.json >/dev/null 2>&1 && python3 -c 'import json; d=json.load(open("/tmp/remotecamera-devices.json"))["result"]["devices"]; d=[x for x in d if x["hardwareProperties"].get("platform")=="iOS" and x["hardwareProperties"].get("deviceType")=="iPhone"]; c=[x for x in d if x["connectionProperties"].get("tunnelState")=="connected"]; print((c or d)[0]["hardwareProperties"]["udid"] if (c or d) else "")')
 
-.PHONY: gen lsp build mac_build mac_run ios_build ios_build_device ios_boot ios_run ios_device clean
+.PHONY: gen lsp build mac_build mac_run mac_install ios_build ios_build_device ios_boot ios_run ios_device clean
 
 gen:
 	xcodegen generate --spec $(SPEC)
@@ -70,6 +73,18 @@ mac_build: gen
 mac_run: mac_build
 	-@pkill -f "$(MAC_APP)/Contents/MacOS/$(PROJECT)"
 	open "$(MAC_APP)"
+
+# Always Release, whatever CONFIGURATION says: this is the copy for everyday use. Signed with the
+# team's development certificate, which is fine on this Mac; another Mac would need a Developer ID
+# signature and notarisation. Any running copy is quit first, the development one included: two
+# remotes would take the iPhone from each other.
+mac_install:
+	@$(MAKE) --no-print-directory mac_build CONFIGURATION=Release
+	-@pkill -f "$(MAC_INSTALLED_APP)/Contents/MacOS/$(PROJECT)"
+	-@pkill -f "$(DERIVED_DATA)/Build/Products/[^/]*/$(PROJECT).app/Contents/MacOS/$(PROJECT)"
+	rm -rf "$(MAC_INSTALLED_APP)"
+	ditto "$(DERIVED_DATA)/Build/Products/Release/$(PROJECT).app" "$(MAC_INSTALLED_APP)"
+	open "$(MAC_INSTALLED_APP)"
 
 ios_build: gen
 	set -o pipefail; $(XCODEBUILD) -destination '$(SIM_DEST)' build | $(PRETTY)

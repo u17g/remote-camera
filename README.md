@@ -14,6 +14,7 @@ and is not checked in. Everything goes through the Makefile:
 
 ```sh
 make mac_run      # build and launch the Mac app
+make mac_install  # an optimised build into /Applications as "Remote Camera", then launch it
 make ios_device   # build, install and launch on the connected iPhone
 make ios_run      # the iPhone app in the Simulator (streams a test pattern: there is no camera)
 make build        # compile both
